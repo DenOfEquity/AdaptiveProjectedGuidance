@@ -43,16 +43,23 @@ class APG:
     ):
         diff = pred_cond - pred_uncond
         if momentum_buffer is not None:
-            momentum_buffer.update(diff)
+            try:
+                momentum_buffer.update(diff)
+            except:
+                pass
             diff = momentum_buffer.running_average
         if norm_threshold > 0:
             ones = torch.ones_like(diff)
             diff_norm = diff.norm(p=2, dim=[-1, -2, -3], keepdim=True)
             scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
             diff = diff * scale_factor
-        diff_parallel, diff_orthogonal = self.project(diff, pred_cond)
-        normalized_update = diff_orthogonal + eta * diff_parallel
-        pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
+        try:
+            diff_parallel, diff_orthogonal = self.project(diff, pred_cond)
+            normalized_update = diff_orthogonal + eta * diff_parallel
+            pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
+        except:
+            pred_guided = pred_cond
+
         return pred_guided
 
 class APGforForge(scripts.Script):
@@ -60,7 +67,7 @@ class APGforForge(scripts.Script):
     
     presets_builtin = [
         #   name, eta, rescale threshold, momentum
-        ('SD 1.5', 0.0, 7.5, -0.75),
+        ('SD 1.5', 0.0, 2.5, -0.45),
         ('SD 2.1', 0.0, 7.5, -0.75),
         ('SDXL',   0.0, 15,  -0.5),
     ]
@@ -102,6 +109,19 @@ class APGforForge(scripts.Script):
         ]
 
         return apg_enabled, apg_eta, apg_r, apg_m
+        
+    def process(self, p, *script_args, **kwargs):
+        apg_enabled, apg_eta, apg_r, apg_m = script_args
+
+        if apg_enabled:
+            p.extra_generation_params.update(dict(
+                APG_enabled   = apg_enabled,
+                APG_eta       = apg_eta,
+                APG_r         = apg_r,
+                APG_m         = apg_m,
+            ))
+
+        return
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
         apg_enabled, apg_eta, apg_r, apg_m = script_args
@@ -130,14 +150,6 @@ class APGforForge(scripts.Script):
         unet = patch(unet, apg_eta, apg_r, apg_m)[0]
 
         p.sd_model.forge_objects.unet = unet
-
-        # Below codes will add some logs to the texts below the image outputs on UI.
-        p.extra_generation_params.update(dict(
-            APG_enabled   = apg_enabled,
-            APG_eta       = apg_eta,
-            APG_r         = apg_r,
-            APG_m         = apg_m,
-        ))
 
         return
 
