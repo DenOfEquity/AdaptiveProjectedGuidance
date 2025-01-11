@@ -53,11 +53,13 @@ class APG:
             diff_norm = diff.norm(p=2, dim=[-1, -2, -3], keepdim=True)
             scale_factor = torch.minimum(ones, norm_threshold / diff_norm)
             diff = diff * scale_factor
-        try:
-            diff_parallel, diff_orthogonal = self.project(diff, pred_cond)
-            normalized_update = diff_orthogonal + eta * diff_parallel
-            pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
-        except:
+            try:
+                diff_parallel, diff_orthogonal = self.project(diff, pred_cond)
+                normalized_update = diff_orthogonal + eta * diff_parallel
+                pred_guided = pred_cond + (guidance_scale - 1) * normalized_update
+            except:
+                pred_guided = pred_cond
+        else:
             pred_guided = pred_cond
 
         return pred_guided
@@ -67,7 +69,8 @@ class APGforForge(scripts.Script):
     
     presets_builtin = [
         #   name, eta, rescale threshold, momentum
-        ('SD 1.5', 0.0, 2.5, -0.45),
+        ('SD 1.5', 0.0, 6.5, -0.5),
+        ('SD 1.5 CFG++', 0.0, 2.5, -0.45),
         ('SD 2.1', 0.0, 7.5, -0.75),
         ('SDXL',   0.0, 15,  -0.5),
     ]
@@ -86,10 +89,14 @@ class APGforForge(scripts.Script):
     def ui(self, *args, **kwargs):
         
         with InputAccordion(False, label=self.title()) as apg_enabled:
-            apg_eta = gr.Slider(label='eta (saturation)', minimum=-1.0, maximum=1, step=0.01, value=0.0)
+            apg_eta = gr.Slider(label='eta (contrast)', minimum=-1.0, maximum=1, step=0.01, value=0.0)
             apg_r   = gr.Slider(label='rescale threshold', minimum=0, maximum=20, step=0.01, value=8.0)
             apg_m   = gr.Slider(label='momentum', minimum=-1.0, maximum=1.0, step=0.01, value=-0.5)
-            apg_preset = gr.Dropdown(label='', choices=[x[0] for x in APGforForge.presets], value='(presets)', type='index', scale=0, allow_custom_value=True)
+            with gr.Row():
+                apg_icg = gr.Slider(label='image Independent Condition Guidance', minimum=0.0, maximum=1.0, step=0.01, value=0.0) #max 0.2?
+                apg_icg_s = gr.Slider(label='ICG start', minimum=0.0, maximum=1.0, step=0.01, value=0.4)
+            with gr.Row():
+                apg_preset = gr.Dropdown(label='', choices=[x[0] for x in APGforForge.presets], value='(presets)', type='index', scale=0, allow_custom_value=True)
 
         def setParams (preset):
             if preset < len(APGforForge.presets):
@@ -101,17 +108,26 @@ class APGforForge(scripts.Script):
         apg_preset.input(fn=setParams, inputs=[apg_preset],
                          outputs=[apg_eta, apg_r, apg_m, apg_preset], show_progress=False)
 
+        apg_enabled.do_not_save_to_config = True
+        apg_eta.do_not_save_to_config = True
+        apg_r.do_not_save_to_config = True
+        apg_m.do_not_save_to_config = True
+        apg_icg.do_not_save_to_config = True
+        apg_icg_s.do_not_save_to_config = True
+
         self.infotext_fields = [
             (apg_enabled, lambda d: d.get("APG_enabled", False)),
             (apg_eta,      "APG_eta"),
             (apg_r,        "APG_r"),
             (apg_m,        "APG_m"),
+            (apg_icg,      "APG_ICG"),
+            (apg_icg_s,    "APG_ICG_start"),
         ]
 
-        return apg_enabled, apg_eta, apg_r, apg_m
+        return apg_enabled, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s
         
     def process(self, p, *script_args, **kwargs):
-        apg_enabled, apg_eta, apg_r, apg_m = script_args
+        apg_enabled, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s = script_args
 
         if apg_enabled:
             p.extra_generation_params.update(dict(
@@ -119,24 +135,33 @@ class APGforForge(scripts.Script):
                 APG_eta       = apg_eta,
                 APG_r         = apg_r,
                 APG_m         = apg_m,
+                APG_ICG       = apg_icg,
+                APG_ICG_start = apg_icg_s,
             ))
 
         return
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        apg_enabled, apg_eta, apg_r, apg_m = script_args
+        apg_enabled, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s = script_args
 
         if not apg_enabled:
             return
 
-        def patch(model, eta, r, m):
+        def patch(model, eta, r, m, icg, icg_start):
             apg = APG(eta, r, m)
+            start = model.model.predictor.percent_to_sigma(icg_start)
             
             def sampler_apg(args):
                 input = args["input"]
                 cond = input - args["cond"]
                 uncond = input - args["uncond"]
                 cond_scale = args["cond_scale"]
+                sigma = args["sigma"]
+                
+                if icg > 0 and sigma <=start:
+                    icg_uncond = torch.randn_like(uncond)
+                    icg_uncond *= uncond.std()
+                    torch.lerp(uncond, icg_uncond, icg, out=uncond)
 
                 return input - apg.normalized_guidance(cond, uncond, cond_scale, apg.momentum, apg.eta, apg.r)
 
@@ -147,7 +172,7 @@ class APGforForge(scripts.Script):
 
         unet = p.sd_model.forge_objects.unet
 
-        unet = patch(unet, apg_eta, apg_r, apg_m)[0]
+        unet = patch(unet, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s)[0]
 
         p.sd_model.forge_objects.unet = unet
 
