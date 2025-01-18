@@ -5,7 +5,7 @@
 ---
 controls described in the paper
 
-eta affects saturation
+eta affects saturation/contrast
 
 rescale threshold ... highly variable depending on model, experiment
 
@@ -20,3 +20,17 @@ Anyway, it does *something*.
 
 #### sd1.5 model swizz8real cfg 15 ####
 ![](woodelves2.png) 
+
+
+---
+Also, 
+
+### TraSCE: Trajectory Steering for Concept Erasure https://arxiv.org/abs/2412.07658 ###
+
+Intent from the paper is to improve the ability of the negative prompt to remove/control concepts: using a negative is necessary - no effect if the negative prompt is empty.
+
+Basically, `cfg_result = empty_conditioning + guidance * (positive_conditioning - negative_conditioning)`.
+
+Standard is `cfg_result = negative_conditioning + guidance * (positive_conditioning - negative_conditioning)`.
+
+---
