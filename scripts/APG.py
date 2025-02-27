@@ -1,5 +1,6 @@
 import torch
 import gradio as gr
+import copy
 
 from modules import scripts, shared
 from backend.sampling.condition import Condition, compile_conditions
@@ -93,7 +94,7 @@ class APGforForge(scripts.Script):
     def ui(self, *args, **kwargs):
         
         with InputAccordion(False, label=self.title()) as apg_enabled:
-            apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "Normal"], value="APG")
+            apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "method two", "Normal"], value="APG")
 
             apg_eta = gr.Slider(label='eta (contrast)', minimum=-1.0, maximum=1, step=0.01, value=0.0)
             apg_r   = gr.Slider(label='rescale threshold', minimum=0, maximum=20, step=0.01, value=8.0)
@@ -101,6 +102,14 @@ class APGforForge(scripts.Script):
             with gr.Row():
                 apg_icg = gr.Slider(label='image Independent Condition Guidance', minimum=0.0, maximum=0.2, step=0.001, value=0.0)
                 apg_icg_s = gr.Slider(label='ICG start', minimum=0.0, maximum=1.0, step=0.01, value=0.4)
+                
+            apg_post_cfg = gr.Radio(label='post CFG method', choices=["SLG (SD3)", "None"], value="None")
+            with gr.Row(visible=False) as slg_1:
+                apg_slg_scale = gr.Slider(label='Skip Layer Guidance', minimum=0.0, maximum=16.0, step=0.1, value=2.7)
+                apg_slg_layers = gr.Textbox(label='SLG layers (list)', value="7, 8, 9", interactive=True, max_lines=1)
+            with gr.Row(visible=False) as slg_2:
+                apg_slg_start = gr.Slider(label='SLG start', minimum=0.0, maximum=1.0, step=0.01, value=0.01)
+                apg_slg_end = gr.Slider(label='SLG end', minimum=0.0, maximum=1.0, step=0.01, value=0.2)
             with gr.Row():
                 apg_preset = gr.Dropdown(label='', choices=[x[0] for x in APGforForge.presets], value='(APG presets)', type='index', scale=0, allow_custom_value=True)
 
@@ -118,35 +127,51 @@ class APGforForge(scripts.Script):
             visible = True if method == "APG" else False
             return gr.update(visible=visible), gr.update(visible=visible), gr.update(visible=visible)
 
+        def show_post_cfg (method):
+            visible = True if method == "SLG (SD3)" else False
+            return gr.update(visible=visible), gr.update(visible=visible)
+
         apg_method.change(fn=show_options, inputs=[apg_method], outputs=[apg_eta, apg_r, apg_m], show_progress=False)
+        apg_post_cfg.change(fn=show_post_cfg, inputs=[apg_post_cfg], outputs=[slg_1, slg_2], show_progress=False)
 
         apg_enabled.do_not_save_to_config = True
         apg_method.do_not_save_to_config = True
+        apg_post_cfg.do_not_save_to_config = True
         apg_eta.do_not_save_to_config = True
         apg_r.do_not_save_to_config = True
         apg_m.do_not_save_to_config = True
         apg_icg.do_not_save_to_config = True
         apg_icg_s.do_not_save_to_config = True
+        apg_slg_scale.do_not_save_to_config = True
+        apg_slg_layers.do_not_save_to_config = True
+        apg_slg_start.do_not_save_to_config = True
+        apg_slg_end.do_not_save_to_config = True
 
         self.infotext_fields = [
             (apg_enabled, lambda d: d.get("APG_enabled", False)),
-            (apg_method,   "APG_method"),
-            (apg_eta,      "APG_eta"),
-            (apg_r,        "APG_r"),
-            (apg_m,        "APG_m"),
-            (apg_icg,      "APG_ICG"),
-            (apg_icg_s,    "APG_ICG_start"),
+            (apg_method,    "APG_method"),
+            (apg_post_cfg,  "APG_post_cfg"),
+            (apg_eta,       "APG_eta"),
+            (apg_r,         "APG_r"),
+            (apg_m,         "APG_m"),
+            (apg_icg,       "APG_ICG"),
+            (apg_icg_s,     "APG_ICG_start"),
+            (apg_slg_scale, "APG_SLG_scale"),
+            (apg_slg_layers,"APG_SLG_layers"),
+            (apg_slg_start, "APG_SLG_start"),
+            (apg_slg_end,   "APG_SLG_end"),
         ]
 
-        return apg_enabled, apg_method, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s
+        return apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end
         
     def process(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s = script_args
+        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
 
         if apg_enabled:
             p.extra_generation_params.update(dict(
                 APG_enabled   = apg_enabled,
                 APG_method    = apg_method,
+                APG_post_cfg  = apg_post_cfg,
                 APG_ICG       = apg_icg,
                 APG_ICG_start = apg_icg_s,
             ))
@@ -156,11 +181,18 @@ class APGforForge(scripts.Script):
                     APG_r         = apg_r,
                     APG_m         = apg_m,
                 ))
+            if apg_post_cfg == "SLG (SD3)":
+                p.extra_generation_params.update(dict(
+                    APG_SLG_scale   = apg_slg_scale,
+                    APG_SLG_layers  = apg_slg_layers,
+                    APG_SLG_start   = apg_slg_start,
+                    APG_SLG_end     = apg_slg_end,
+                ))
 
         return
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s = script_args
+        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
 
         if not apg_enabled:
             return
@@ -193,13 +225,34 @@ class APGforForge(scripts.Script):
                     case "TraSCE":
                         bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
                         denoised = bias + cond_scale * (cond - uncond)
+                    case "method two":
+                        bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
+                        cond_scale *= 0.5
+                        denoised = (2*cond_scale + 1.0) * cond - cond_scale * (bias + uncond)
                     case _:
                         denoised = uncond + cond_scale * (cond - uncond)
-
                 return input - denoised
+
+
+            def post_cfg_apg(args):
+                denoised, cond, cond_denoised, sigma, x, options = \
+                    args["denoised"], args["cond"], args["cond_denoised"], args["sigma"], args["input"], args["model_options"]
+
+                match apg_post_cfg:
+                    case "SLG (SD3)":
+                        if sigma <= model.model.predictor.percent_to_sigma(apg_slg_start) and sigma >= model.model.predictor.percent_to_sigma(apg_slg_end):
+                            slg_options = copy.deepcopy(options)
+                            slg_options["transformer_options"]["skip_layers"] = [int(num) for num in apg_slg_layers.split(',')]
+                            SLG, _ = calc_cond_uncond_batch(model.model, cond, None, x, sigma, slg_options)
+
+                            denoised = denoised + (cond_denoised - SLG) * apg_slg_scale
+# add PPAG?
+                return denoised
 
             m = model.clone()
             m.set_model_sampler_cfg_function(sampler_apg)
+            if p.sd_model.is_sd3:
+                m.set_model_sampler_post_cfg_function(post_cfg_apg)
             return (m, )
 
 
