@@ -1,4 +1,4 @@
-## Adaptive Projected Guidance ##
+## Adaptive Projected Guidance for Forge2 webUI ##
 ### APG code from ELIMINATING OVERSATURATION AND ARTIFACTS OF HIGH GUIDANCE SCALES IN DIFFUSION MODELS ###
 ### credit to Seyedmorteza Sadat, Otmar Hilliges, Romann M. Weber ###
 ### https://arxiv.org/pdf/2410.02416 ###
@@ -34,3 +34,4 @@ Basically, `cfg_result = empty_conditioning + guidance * (positive_conditioning 
 Standard is `cfg_result = negative_conditioning + guidance * (positive_conditioning - negative_conditioning)`.
 
 ---
+Also, some other experimental stuff. And SkipLayerGuidance for SD3.
