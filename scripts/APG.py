@@ -71,6 +71,7 @@ class APG:
 class APGforForge(scripts.Script):
     sorting_priority = 11.9
     empty = None
+    storeCFG = 1.0
     
     presets_builtin = [
         #   name, eta, rescale threshold, momentum
@@ -102,11 +103,13 @@ class APGforForge(scripts.Script):
             with gr.Row():
                 apg_icg = gr.Slider(label='image Independent Condition Guidance', minimum=0.0, maximum=0.2, step=0.001, value=0.0)
                 apg_icg_s = gr.Slider(label='ICG start', minimum=0.0, maximum=1.0, step=0.01, value=0.4)
-                
-            apg_post_cfg = gr.Radio(label='post CFG method', choices=["SLG (SD3)", "None"], value="None")
+            with gr.Row():
+                apg_star = gr.Checkbox(label='use CFG *', value=False)
+
+            apg_post_cfg = gr.Radio(label='post CFG method', choices=["MaHiRo", "SLG (SD3)", "None"], value="None")
             with gr.Row(visible=False) as slg_1:
                 apg_slg_scale = gr.Slider(label='Skip Layer Guidance', minimum=0.0, maximum=16.0, step=0.1, value=2.7)
-                apg_slg_layers = gr.Textbox(label='SLG layers (list)', value="7, 8, 9", interactive=True, max_lines=1)
+                apg_slg_layers = gr.Textbox(label='SLG layers', value="7, 8, 9", interactive=True, max_lines=1)
             with gr.Row(visible=False) as slg_2:
                 apg_slg_start = gr.Slider(label='SLG start', minimum=0.0, maximum=1.0, step=0.01, value=0.01)
                 apg_slg_end = gr.Slider(label='SLG end', minimum=0.0, maximum=1.0, step=0.01, value=0.2)
@@ -142,6 +145,7 @@ class APGforForge(scripts.Script):
         apg_m.do_not_save_to_config = True
         apg_icg.do_not_save_to_config = True
         apg_icg_s.do_not_save_to_config = True
+        apg_star.do_not_save_to_config = True
         apg_slg_scale.do_not_save_to_config = True
         apg_slg_layers.do_not_save_to_config = True
         apg_slg_start.do_not_save_to_config = True
@@ -156,16 +160,17 @@ class APGforForge(scripts.Script):
             (apg_m,         "APG_m"),
             (apg_icg,       "APG_ICG"),
             (apg_icg_s,     "APG_ICG_start"),
+            (apg_star,      "APG_CFGstar"),
             (apg_slg_scale, "APG_SLG_scale"),
             (apg_slg_layers,"APG_SLG_layers"),
             (apg_slg_start, "APG_SLG_start"),
             (apg_slg_end,   "APG_SLG_end"),
         ]
 
-        return apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end
+        return apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end
         
     def process(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
+        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
 
         if apg_enabled:
             p.extra_generation_params.update(dict(
@@ -174,6 +179,7 @@ class APGforForge(scripts.Script):
                 APG_post_cfg  = apg_post_cfg,
                 APG_ICG       = apg_icg,
                 APG_ICG_start = apg_icg_s,
+                APG_CFGstar   = apg_star,
             ))
             if apg_method == "APG":
                 p.extra_generation_params.update(dict(
@@ -192,12 +198,12 @@ class APGforForge(scripts.Script):
         return
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
+        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
 
         if not apg_enabled:
             return
 
-        def patch(model, eta, r, m, icg, icg_start):
+        def patch(model, eta, r, m, icg, icg_start, cfg_star):
             apg = APG(eta, r, m)
             start = model.model.predictor.percent_to_sigma(icg_start)
             
@@ -209,6 +215,8 @@ class APGforForge(scripts.Script):
                 sigma = args["sigma"]
                 options = args["model_options"]
                 
+                APGforForge.storeCFG = cond_scale   # for MaHiRo post_cfg
+                
                 if icg > 0 and sigma <= start:
                     factor = icg
                     if apg_method != "APG":
@@ -218,6 +226,20 @@ class APGforForge(scripts.Script):
                     icg_uncond = torch.randn_like(uncond)
                     icg_uncond *= uncond.std()
                     torch.lerp(uncond, icg_uncond, factor, out=uncond)
+
+                if cfg_star:
+                    batch_size = cond.shape[0]
+                    cond_flat = cond.view(batch_size, -1)  
+                    uncond_flat = uncond.view(batch_size, -1)  
+                    # Calculate dot production
+                    dot_product = torch.sum(cond_flat * uncond_flat, dim=1, keepdim=True)
+
+                    # Squared norm of uncondition
+                    squared_norm = torch.sum(uncond_flat ** 2, dim=1, keepdim=True) + 1e-8
+
+                    st_star = dot_product / squared_norm
+
+                    uncond *= st_star.view(batch_size, 1, 1, 1)
 
                 match apg_method:
                     case "APG":
@@ -233,12 +255,25 @@ class APGforForge(scripts.Script):
                         denoised = uncond + cond_scale * (cond - uncond)
                 return input - denoised
 
-
             def post_cfg_apg(args):
                 denoised, cond, cond_denoised, sigma, x, options = \
                     args["denoised"], args["cond"], args["cond_denoised"], args["sigma"], args["input"], args["model_options"]
 
                 match apg_post_cfg:
+                    case "MaHiRo":
+                        #   via ForgeClassic, via ComfyUI, original by yoinked-h
+                        scale = APGforForge.storeCFG    # should this be independant?
+                        uncond_denoised: torch.Tensor = args["uncond_denoised"]
+                        leap = cond_denoised * scale
+                        u_leap = uncond_denoised * scale
+
+                        merge = (leap + denoised) / 2
+                        normu = torch.sqrt(u_leap.abs()) * u_leap.sign()
+                        normm = torch.sqrt(merge.abs()) * merge.sign()
+                        sim = torch.nn.functional.cosine_similarity(normu, normm).mean()
+                        simsc = 2 * (sim + 1)
+                        denoised = (simsc * denoised + (4 - simsc) * leap) / 4
+
                     case "SLG (SD3)":
                         if sigma <= model.model.predictor.percent_to_sigma(apg_slg_start) and sigma >= model.model.predictor.percent_to_sigma(apg_slg_end):
                             slg_options = copy.deepcopy(options)
@@ -251,18 +286,19 @@ class APGforForge(scripts.Script):
 
             m = model.clone()
             m.set_model_sampler_cfg_function(sampler_apg)
-            if p.sd_model.is_sd3:
+            if apg_post_cfg != "None":
                 m.set_model_sampler_post_cfg_function(post_cfg_apg)
             return (m, )
 
 
         unet = p.sd_model.forge_objects.unet
-        unet = patch(unet, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s)[0]
+        unet = patch(unet, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star)[0]
         p.sd_model.forge_objects.unet = unet
 
-        empty_prompt = SdConditioning([""], is_negative_prompt=False, width=p.width, height=p.height)
-        empty_cond = shared.sd_model.get_learned_conditioning(empty_prompt)
-        APGforForge.empty = compile_conditions(empty_cond)
+        if apg_method == "TraSCE" or apg_method == "method two":
+            empty_prompt = SdConditioning([""], is_negative_prompt=False, width=p.width, height=p.height)
+            empty_cond = shared.sd_model.get_learned_conditioning(empty_prompt)
+            APGforForge.empty = compile_conditions(empty_cond)
 
         return
 
