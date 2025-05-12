@@ -1,12 +1,14 @@
-import torch
+import torch, math
 import gradio as gr
 import copy
 
 from modules import scripts, shared
 from backend.sampling.condition import Condition, compile_conditions
+import backend.sampling.sampling_function
 from backend.sampling.sampling_function import calc_cond_uncond_batch
 from modules.prompt_parser import SdConditioning
 from modules.ui_components import InputAccordion
+from modules.script_callbacks import on_cfg_denoiser, remove_current_script_callbacks
 
 
 class MomentumBuffer:
@@ -72,7 +74,13 @@ class APGforForge(scripts.Script):
     sorting_priority = 11.9
     empty = None
     storeCFG = 1.0
-    
+    CFGweight = 1.0
+    backup_sampling_function_inner = None
+
+    def __init__(self):
+        if APGforForge.backup_sampling_function_inner == None:
+            APGforForge.backup_sampling_function_inner = backend.sampling.sampling_function.sampling_function_inner
+
     presets_builtin = [
         #   name, eta, rescale threshold, momentum
         ('SD 1.5', 0.0, 6.5, -0.5),
@@ -93,9 +101,32 @@ class APGforForge(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, *args, **kwargs):
-        
+
         with InputAccordion(False, label=self.title()) as apg_enabled:
             apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "method two", "Normal"], value="APG")
+
+            with InputAccordion(False, label='CFG fade') as fade_enabled:
+                with gr.Row():
+                    lowCFG1   = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.1, label='CFG 1 until step')
+                    maxScale  = gr.Slider(minimum=1.0, maximum=4.0,  step=0.01, value=1.0, label='boost factor')
+                with gr.Row():
+                    boostStep = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.2, label='CFG boost start step')
+                    minScale  = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=1.0, label='fade factor')
+                with gr.Row():
+                    highStep  = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.4, label='full boost at step')
+                    heuristic = gr.Slider(minimum=0.0, maximum=16.0, step=0.1,  value=0,   label='Heuristic CFG (for Normal)')
+                with gr.Row():
+                    fadeStep  = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.5, label='CFG fade start step')
+                    hStart    = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.0, label='... start step for heuristic CFG')
+                with gr.Row():
+                    zeroStep  = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.7, label='full fade at step')
+                    reinhard  = gr.Slider(minimum=0.0, maximum=16.0, step=0.1,  value=0.0, label='Reinhard CFG (for Normal)')
+                with gr.Row():
+                    highCFG1  = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.8, label='CFG 1 after step')
+                    rescale   = gr.Slider(minimum=0.0, maximum=1.0,  step=0.01, value=0.0, label='Rescale CFG (for Normal)')
+
+                with gr.Row():
+                    cntrMean   = gr.Checkbox(value=False, label='centre conds to mean') #add other methods?
 
             apg_eta = gr.Slider(label='eta (contrast)', minimum=-1.0, maximum=1, step=0.01, value=0.0)
             apg_r   = gr.Slider(label='rescale threshold', minimum=0, maximum=20, step=0.01, value=8.0)
@@ -137,20 +168,6 @@ class APGforForge(scripts.Script):
         apg_method.change(fn=show_options, inputs=[apg_method], outputs=[apg_eta, apg_r, apg_m], show_progress=False)
         apg_post_cfg.change(fn=show_post_cfg, inputs=[apg_post_cfg], outputs=[slg_1, slg_2], show_progress=False)
 
-        apg_enabled.do_not_save_to_config = True
-        apg_method.do_not_save_to_config = True
-        apg_post_cfg.do_not_save_to_config = True
-        apg_eta.do_not_save_to_config = True
-        apg_r.do_not_save_to_config = True
-        apg_m.do_not_save_to_config = True
-        apg_icg.do_not_save_to_config = True
-        apg_icg_s.do_not_save_to_config = True
-        apg_star.do_not_save_to_config = True
-        apg_slg_scale.do_not_save_to_config = True
-        apg_slg_layers.do_not_save_to_config = True
-        apg_slg_start.do_not_save_to_config = True
-        apg_slg_end.do_not_save_to_config = True
-
         self.infotext_fields = [
             (apg_enabled, lambda d: d.get("APG_enabled", False)),
             (apg_method,    "APG_method"),
@@ -165,22 +182,82 @@ class APGforForge(scripts.Script):
             (apg_slg_layers,"APG_SLG_layers"),
             (apg_slg_start, "APG_SLG_start"),
             (apg_slg_end,   "APG_SLG_end"),
+
+            (fade_enabled, lambda d: d.get("apg_fade_enabled", False)),
+            (cntrMean,  "apg_fade_cntrMean"),
+            (boostStep, "apg_fade_boostStep"),
+            (highStep,  "apg_fade_highStep"),
+            (maxScale,  "apg_fade_maxScale"),
+            (fadeStep,  "apg_fade_fadeStep"),
+            (zeroStep,  "apg_fade_zeroStep"),
+            (minScale,  "apg_fade_minScale"),
+            (lowCFG1,   "apg_fade_lowCFG1"),
+            (highCFG1,  "apg_fade_highCFG1"),
+            (reinhard,  "apg_fade_reinhard"),
+            (rescale,   "apg_fade_rescale"),
+            (heuristic, "apg_fade_heuristic"),
+            (hStart,    "apg_fade_hStart"),
         ]
 
-        return apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end
-        
+        return (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star,
+                apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
+                fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart)
+
+    def denoiser_callback(self, params):
+        lastStep = params.total_sampling_steps - 1
+        thisStep = params.sampling_step
+        sigma = params.sigma[0]
+
+        lowCFG1   = self.lowCFG1   * lastStep
+        highStep  = self.highStep  * lastStep
+        boostStep = self.boostStep * lastStep
+        highCFG1  = self.highCFG1  * lastStep
+        fadeStep  = self.fadeStep  * lastStep
+        zeroStep  = self.zeroStep  * lastStep
+
+        if thisStep < lowCFG1:
+            boostWeight = 0.0
+        elif thisStep < boostStep:
+            boostWeight = 1.0
+        elif thisStep < highStep:
+            boostWeight = 1.0 + (self.maxScale - 1.0) * ((thisStep - boostStep) / (highStep - boostStep))
+        else:
+            boostWeight = self.maxScale
+
+        if thisStep > highCFG1:
+            fadeWeight = 0.0
+        else:
+            if thisStep < fadeStep:
+                fadeWeight = 1.0
+            elif thisStep < zeroStep:
+                fadeWeight = 1.0 - (thisStep - fadeStep) / (zeroStep  - fadeStep)
+            else:
+                fadeWeight = 0.0
+
+            # at this point, weight is in the range 0.0->1.0
+            fadeWeight *= (1.0 - self.minScale)
+            fadeWeight += self.minScale
+            # now it is minimum->1.0
+
+        APGforForge.CFGweight = boostWeight * fadeWeight
+
     def process(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale,
+        apg_slg_layers, apg_slg_start, apg_slg_end,
+        fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
         if apg_enabled:
             p.extra_generation_params.update(dict(
                 APG_enabled   = apg_enabled,
                 APG_method    = apg_method,
                 APG_post_cfg  = apg_post_cfg,
-                APG_ICG       = apg_icg,
-                APG_ICG_start = apg_icg_s,
                 APG_CFGstar   = apg_star,
             ))
+            if apg_icg > 0.0:
+                p.extra_generation_params.update(dict(
+                    APG_ICG       = apg_icg,
+                    APG_ICG_start = apg_icg_s,
+                ))
             if apg_method == "APG":
                 p.extra_generation_params.update(dict(
                     APG_eta       = apg_eta,
@@ -195,18 +272,96 @@ class APGforForge(scripts.Script):
                     APG_SLG_end     = apg_slg_end,
                 ))
 
+            self.boostStep  = boostStep
+            self.highStep   = highStep
+            self.maxScale   = maxScale
+            self.fadeStep   = fadeStep
+            self.zeroStep   = zeroStep
+            self.minScale   = minScale
+            self.lowCFG1    = lowCFG1
+            self.highCFG1   = highCFG1
+            APGforForge.heuristic  = heuristic
+            APGforForge.reinhard   = reinhard
+
+            # logs, could save boost start/full only if boost factor > 1
+            #       similar for fade
+            if fade_enabled:
+                p.extra_generation_params.update(dict(
+                    apg_fade_enabled   = fade_enabled,
+                    apg_fade_cntrMean  = cntrMean,
+                    apg_fade_boostStep = boostStep,
+                    apg_fade_highStep  = highStep,
+                    apg_fade_maxScale  = maxScale,
+                    apg_fade_fadeStep  = fadeStep,
+                    apg_fade_zeroStep  = zeroStep,
+                    apg_fade_minScale  = minScale,
+                    apg_fade_lowCFG1   = lowCFG1,
+                    apg_fade_highCFG1  = highCFG1,
+                    apg_fade_reinhard  = reinhard,
+                    apg_fade_rescale   = rescale,
+                    apg_fade_heuristic = heuristic,
+                    apg_fade_hStart    = hStart,
+                ))
+                #   must log the parameters before fixing minScale
+                self.minScale /= self.maxScale
+
+                on_cfg_denoiser(self.denoiser_callback)
+
+                backend.sampling.sampling_function.sampling_function_inner = APGforForge.sampling_function_inner
+
         return
 
+
+#   edited from backend/sampling/sampling_function.py to add cond_scaling (initial 3 lines)
+    def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False):
+        cond_scale *= APGforForge.CFGweight
+        if cond_scale < 1.0:
+            cond_scale = 1.0
+
+        edit_strength = sum((item['strength'] if 'strength' in item else 1) for item in cond)
+
+        if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
+            uncond_ = None
+        else:
+            uncond_ = uncond
+
+        for fn in model_options.get("sampler_pre_cfg_function", []):
+            model, cond, uncond_, x, timestep, model_options = fn(model, cond, uncond_, x, timestep, model_options)
+
+        cond_pred, uncond_pred = calc_cond_uncond_batch(model, cond, uncond_, x, timestep, model_options)
+
+        if "sampler_cfg_function" in model_options:
+            args = {"cond": x - cond_pred, "uncond": x - uncond_pred, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep,
+                    "cond_denoised": cond_pred, "uncond_denoised": uncond_pred, "model": model, "model_options": model_options}
+            cfg_result = x - model_options["sampler_cfg_function"](args)
+        elif not math.isclose(edit_strength, 1.0):
+            cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale * edit_strength
+        else:
+            cfg_result = uncond_pred + (cond_pred - uncond_pred) * cond_scale
+
+        for fn in model_options.get("sampler_post_cfg_function", []):
+            args = {"denoised": cfg_result, "cond": cond, "uncond": uncond, "model": model, "uncond_denoised": uncond_pred, "cond_denoised": cond_pred,
+                    "sigma": timestep, "model_options": model_options, "input": x}
+            cfg_result = fn(args)
+
+        if return_full:
+            return cfg_result, cond_pred, uncond_pred
+
+        return cfg_result
+
+
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end = script_args
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star,
+        apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
+        fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
         if not apg_enabled:
             return
 
         def patch(model, eta, r, m, icg, icg_start, cfg_star):
             apg = APG(eta, r, m)
-            start = model.model.predictor.percent_to_sigma(icg_start)
-            
+            # start = model.model.predictor.percent_to_sigma(icg_start)
+
             def sampler_apg(args):
                 input = args["input"]
                 cond = args["cond_denoised"]
@@ -216,44 +371,134 @@ class APGforForge(scripts.Script):
                 options = args["model_options"]
                 
                 APGforForge.storeCFG = cond_scale   # for MaHiRo post_cfg
+
+                if cntrMean == True:
+                    for b in range(len(cond)):
+                        for c in range(4):
+                            cond[b][c] -= cond[b][c].mean()
+                            uncond[b][c] -= uncond[b][c].mean()
                 
-                if icg > 0 and sigma <= start:
-                    factor = icg
-                    if apg_method != "APG":
-                        factor *= 0.1
-                    factor *= min(1.0, sigma)
+                if cond_scale > 1.0:
+                    if icg > 0 and shared.state.sampling_step / (shared.state.sampling_steps - 1) >= icg_start:
+                        factor = icg
+                        if apg_method != "APG":
+                            factor *= 0.1
+                        factor *= min(1.0, sigma)
 
-                    icg_uncond = torch.randn_like(uncond)
-                    icg_uncond *= uncond.std()
-                    torch.lerp(uncond, icg_uncond, factor, out=uncond)
+                        icg_uncond = torch.randn_like(uncond)
+                        icg_uncond *= uncond.std()
+                        torch.lerp(uncond, icg_uncond, factor, out=uncond)
 
-                if cfg_star:
-                    batch_size = cond.shape[0]
-                    cond_flat = cond.view(batch_size, -1)  
-                    uncond_flat = uncond.view(batch_size, -1)  
-                    # Calculate dot production
-                    dot_product = torch.sum(cond_flat * uncond_flat, dim=1, keepdim=True)
+                    if cfg_star:
+                        batch_size = cond.shape[0]
+                        cond_flat = cond.view(batch_size, -1)  
+                        uncond_flat = uncond.view(batch_size, -1)  
+                        # Calculate dot product
+                        dot_product = torch.sum(cond_flat * uncond_flat, dim=1, keepdim=True)
 
-                    # Squared norm of uncondition
-                    squared_norm = torch.sum(uncond_flat ** 2, dim=1, keepdim=True) + 1e-8
+                        # Squared norm of uncondition
+                        squared_norm = torch.sum(uncond_flat ** 2, dim=1, keepdim=True) + 1e-8
 
-                    st_star = dot_product / squared_norm
+                        st_star = dot_product / squared_norm
 
-                    uncond *= st_star.view(batch_size, 1, 1, 1)
+                        uncond *= st_star.view(batch_size, 1, 1, 1)
+
+                    args["uncond"] = input - uncond
 
                 match apg_method:
                     case "APG":
-                        denoised =  apg.normalized_guidance(cond, uncond, cond_scale, apg.momentum, apg.eta, apg.r)
+                        denoised = apg.normalized_guidance(cond, uncond, cond_scale, apg.momentum, apg.eta, apg.r)
+                        return input - denoised
                     case "TraSCE":
-                        bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
-                        denoised = bias + cond_scale * (cond - uncond)
+                        if cond_scale > 1.0:
+                            bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
+                            denoised = bias + cond_scale * (cond - uncond)
+                        else:
+                            denoised = cond
+                        return input - denoised
                     case "method two":
-                        bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
-                        cond_scale *= 0.5
-                        denoised = (2*cond_scale + 1.0) * cond - cond_scale * (bias + uncond)
+                        if cond_scale > 1.0:
+                            bias, _ = calc_cond_uncond_batch(model.model, APGforForge.empty, None, input, sigma, options)
+                            cond_scale *= 0.5
+                            denoised = (2*cond_scale + 1.0) * cond - cond_scale * (bias + uncond)
+                        else:
+                            denoised = cond
+                        return input - denoised
                     case _:
-                        denoised = uncond + cond_scale * (cond - uncond)
-                return input - denoised
+                        # denoised = uncond + cond_scale * (cond - uncond)
+                        if cond_scale > 1.0:
+                            nonlocal hStart, rescale
+                            cond = args["cond"]
+                            uncond = args["uncond"]
+                            heuristic = APGforForge.heuristic * APGforForge.CFGweight
+                            reinhard = APGforForge.reinhard * APGforForge.CFGweight
+
+            #   cond_scale weighting now applied in sampling_function_inner, can avoid processing of uncond for performance increase
+
+                            thisStep = shared.state.sampling_step
+                            lastStep = shared.state.sampling_steps
+
+                            noisePrediction = cond - uncond
+
+            #   heuristic scaling, higher hcfg acts to boost contrast/detail/sharpness; low reduces; quantile has effect, but not significant for quality IMO
+                            if heuristic != 0.0 and heuristic != cond_scale and thisStep >= hStart * (lastStep - 1):
+                                base = uncond + cond_scale * noisePrediction
+                                heur = uncond + heuristic * noisePrediction
+
+                                #   center both on zero
+                                # if cntrMean:
+                                    # base = base - base.mean()
+                                    # heur = heur - heur.mean()
+
+                                #   calc 99.0% quartiles - doesn't seem to have value as an option
+                                baseQ = torch.quantile(base.abs(), 0.99)
+                                heurQ = torch.quantile(heur.abs(), 0.99)
+                                del base, heur
+
+                                if baseQ != 0.0 and heurQ != 0.0:
+                                    cond *= (baseQ / heurQ)
+                                    uncond *= (baseQ / heurQ)
+
+                                del baseQ, heurQ
+                                noisePrediction = cond - uncond
+            #   end: heuristic scaling
+
+            #   reinhard tonemap from comfy
+                            if reinhard != 0.0 and reinhard != cond_scale:
+                                multiplier = 1.0 / cond_scale * reinhard
+                                noise_pred_vector_magnitude = (torch.linalg.vector_norm(noisePrediction, dim=(1)) + 0.0000000001)[:,None]
+                                noisePrediction /= noise_pred_vector_magnitude
+
+                                mean = torch.mean(noise_pred_vector_magnitude, dim=(1,2,3), keepdim=True)
+                                std = torch.std(noise_pred_vector_magnitude, dim=(1,2,3), keepdim=True)
+                                top = (std * 3 + mean) * multiplier
+
+                                noise_pred_vector_magnitude *= (1.0 / top)
+                                new_magnitude = noise_pred_vector_magnitude / (noise_pred_vector_magnitude + 1.0)
+                                new_magnitude *= top
+                                cond_scale *= new_magnitude
+            #   end: reinhard
+
+            #   rescaleCFG
+                            denoised = uncond + cond_scale * noisePrediction
+                            if rescale != 0.0:
+                                ro_pos = torch.std(cond, dim=(1,2,3), keepdim=True)
+                                ro_cfg = torch.std(denoised, dim=(1,2,3), keepdim=True)
+
+                                if ro_pos != 0.0 and ro_cfg != 0.0:
+                                    x_rescaled = denoised * (ro_pos / ro_cfg)
+                                    denoised = torch.lerp (denoised, x_rescaled, rescale)
+                                    del x_rescaled
+
+                                del ro_pos, ro_cfg
+            #   end: rescaleCFG
+                            del noisePrediction
+
+                            return denoised
+
+            #   end: if cond_scale > 1.0
+                        else:
+                            return input - cond
 
             def post_cfg_apg(args):
                 denoised, cond, cond_denoised, sigma, x, options = \
@@ -302,3 +547,12 @@ class APGforForge(scripts.Script):
 
         return
 
+
+    def postprocess(self, params, processed, *args):
+        enabled = args[0]
+        if enabled: # strictly: if fade_enabled, but no harm in always tidying
+            if APGforForge.backup_sampling_function_inner != None:
+                backend.sampling.sampling_function.sampling_function_inner = APGforForge.backup_sampling_function_inner
+
+        remove_current_script_callbacks()
+        return
