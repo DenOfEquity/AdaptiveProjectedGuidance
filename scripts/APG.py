@@ -207,7 +207,7 @@ class APGforForge(scripts.Script):
         lastStep = params.total_sampling_steps - 1
         thisStep = params.sampling_step
         sigma = params.sigma[0]
-
+        
         lowCFG1   = self.lowCFG1   * lastStep
         highStep  = self.highStep  * lastStep
         boostStep = self.boostStep * lastStep
@@ -360,7 +360,6 @@ class APGforForge(scripts.Script):
 
         def patch(model, eta, r, m, icg, icg_start, cfg_star):
             apg = APG(eta, r, m)
-            # start = model.model.predictor.percent_to_sigma(icg_start)
 
             def sampler_apg(args):
                 input = args["input"]
@@ -436,12 +435,12 @@ class APGforForge(scripts.Script):
             #   cond_scale weighting now applied in sampling_function_inner, can avoid processing of uncond for performance increase
 
                             thisStep = shared.state.sampling_step
-                            lastStep = shared.state.sampling_steps
-
+                            lastStep = shared.state.sampling_steps - 1
+                            
                             noisePrediction = cond - uncond
-
+                            
             #   heuristic scaling, higher hcfg acts to boost contrast/detail/sharpness; low reduces; quantile has effect, but not significant for quality IMO
-                            if heuristic != 0.0 and heuristic != cond_scale and thisStep >= hStart * (lastStep - 1):
+                            if heuristic != 0.0 and heuristic != cond_scale and thisStep >= hStart * lastStep:
                                 base = uncond + cond_scale * noisePrediction
                                 heur = uncond + heuristic * noisePrediction
 
@@ -456,11 +455,8 @@ class APGforForge(scripts.Script):
                                 del base, heur
 
                                 if baseQ != 0.0 and heurQ != 0.0:
-                                    cond *= (baseQ / heurQ)
-                                    uncond *= (baseQ / heurQ)
-
+                                    noisePrediction *= baseQ / heurQ
                                 del baseQ, heurQ
-                                noisePrediction = cond - uncond
             #   end: heuristic scaling
 
             #   reinhard tonemap from comfy
