@@ -35,3 +35,11 @@ Standard is `cfg_result = negative_conditioning + guidance * (positive_condition
 
 ---
 Also, some other experimental stuff. And SkipLayerGuidance for SD3.
+
+---
+Also, Frequency-Decoupled Guidance: https://arxiv.org/pdf/2506.19713.
+
+Input `Frequency-Decoupled Guidance scaler` is at least two numbers for high frequency and low frequency components:
+* `7.0, 1.5` is equivalent to high frequency CFG 7.0 and low frequency CFG 1.5.
+* more levels can be used: `7.0, 5.0, 1.5` for high, middle, low
+* prefix `*` means the value is a multipler for CFG scale: `*1.1, 1.7` means 1.1*CFG scale for high frequency, and low frequency set to 1.7
