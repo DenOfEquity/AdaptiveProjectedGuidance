@@ -11,6 +11,60 @@ from modules.ui_components import InputAccordion
 from modules.script_callbacks import on_cfg_denoiser, remove_current_script_callbacks
 
 
+#### Frequency-Decoupled Guidance: https://arxiv.org/pdf/2506.19713
+####  Seyedmorteza Sadat, Tobias Vontobel, Farnood Salehi, Romann M. Weber
+
+from kornia.geometry import pyrup
+from kornia.geometry.transform import build_laplacian_pyramid
+
+def project(
+    v0: torch.Tensor, # [B, C,H, W]
+    v1: torch.Tensor, # [B, C,H, W]
+):
+    dtype = v0.dtype
+    v0, v1 = v0.double(), v1.double()
+    v1 = torch.nn.functional.normalize(v1, dim=[-1,-2,-3])
+    v0_parallel = (v0 * v1).sum(dim=[-1,-2,-3], keepdim=True) * v1
+    v0_orthogonal = v0 - v0_parallel
+    return v0_parallel.to(dtype), v0_orthogonal.to(dtype)
+
+def build_image_from_pyramid(pyramid):
+    img = pyramid[-1]
+    for i in range(len(pyramid)-2,-1,-1):
+        img = pyrup(img) + pyramid[i]
+    return img
+
+# We assume all model predictions are converted to "x_0" prediction.
+def laplacian_guidance(
+    pred_cond: torch.Tensor, # [B, C, H, W]
+    pred_uncond:torch.Tensor, # [B, C, H, W]
+    guidance_scale=[1.0, 1.0], # Guidance scales from high- to low-frequency
+    # parallel_weights=None, # Optionalweights for projection
+):
+    levels = len(guidance_scale)
+    # if parallel_weights = None:
+        # parallel_weights= [1.0] * levels
+
+    pred_cond_pyramid = build_laplacian_pyramid(pred_cond, levels)
+    pred_uncond_pyramid = build_laplacian_pyramid(pred_uncond, levels)
+
+    pred_guided_pyramid = []
+    parameters = zip(pred_cond_pyramid,pred_uncond_pyramid, guidance_scale)#, parallel_weights)
+    for idx, (p_cond, p_uncond, scale) in enumerate(parameters):
+        diff = p_cond - p_uncond
+        diff_parallel, diff_orthogonal = project(diff, p_cond)
+        diff = diff_parallel + diff_orthogonal
+        p_guided = p_cond + (scale-1) * diff
+        pred_guided_pyramid.append(p_guided)
+    pred_guided = build_image_from_pyramid(pred_guided_pyramid)
+
+    pred_guided = pred_guided[:, :, :pred_cond.shape[2], :pred_cond.shape[3]]
+
+    return pred_guided.to(pred_cond.dtype)
+
+#### end FDG
+
+
 class MomentumBuffer:
     def __init__(self, momentum: float):
         self.momentum = momentum
@@ -103,7 +157,7 @@ class APGforForge(scripts.Script):
     def ui(self, *args, **kwargs):
 
         with InputAccordion(False, label=self.title()) as apg_enabled:
-            apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "method two", "Normal"], value="APG")
+            apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "method two", "FDG", "Normal"], value="APG")
 
             with InputAccordion(False, label='CFG fade') as fade_enabled:
                 with gr.Row():
@@ -131,6 +185,10 @@ class APGforForge(scripts.Script):
             apg_eta = gr.Slider(label='eta (contrast)', minimum=-1.0, maximum=1, step=0.01, value=0.0)
             apg_r   = gr.Slider(label='rescale threshold', minimum=0, maximum=20, step=0.01, value=8.0)
             apg_m   = gr.Slider(label='momentum', minimum=-1.0, maximum=1.0, step=0.01, value=-0.5)
+
+            with gr.Row(visible=False) as fdg:
+                apg_fdg_scale = gr.Textbox(label='Frequency-Decoupled Guidance scaler (high to low; replaces CFG scale)', value="*1.1, 1.5", interactive=True, max_lines=1)
+
             with gr.Row():
                 apg_icg = gr.Slider(label='image Independent Condition Guidance', minimum=0.0, maximum=0.2, step=0.001, value=0.0)
                 apg_icg_s = gr.Slider(label='ICG start', minimum=0.0, maximum=1.0, step=0.01, value=0.4)
@@ -158,14 +216,15 @@ class APGforForge(scripts.Script):
                          outputs=[apg_method, apg_eta, apg_r, apg_m, apg_preset], show_progress=False)
 
         def show_options (method):
-            visible = True if method == "APG" else False
-            return gr.update(visible=visible), gr.update(visible=visible), gr.update(visible=visible)
+            APGvisible = True if "APG" in method else False
+            FDGvisible = True if "FDG" in method else False
+            return gr.update(visible=APGvisible), gr.update(visible=APGvisible), gr.update(visible=APGvisible), gr.update(visible=FDGvisible)
 
         def show_post_cfg (method):
             visible = True if method == "SLG (SD3)" else False
             return gr.update(visible=visible), gr.update(visible=visible)
 
-        apg_method.change(fn=show_options, inputs=[apg_method], outputs=[apg_eta, apg_r, apg_m], show_progress=False)
+        apg_method.change(fn=show_options, inputs=[apg_method], outputs=[apg_eta, apg_r, apg_m, fdg], show_progress=False)
         apg_post_cfg.change(fn=show_post_cfg, inputs=[apg_post_cfg], outputs=[slg_1, slg_2], show_progress=False)
 
         self.infotext_fields = [
@@ -175,6 +234,7 @@ class APGforForge(scripts.Script):
             (apg_eta,       "APG_eta"),
             (apg_r,         "APG_r"),
             (apg_m,         "APG_m"),
+            (apg_fdg_scale, "APG_FDG_scale"),
             (apg_icg,       "APG_ICG"),
             (apg_icg_s,     "APG_ICG_start"),
             (apg_star,      "APG_CFGstar"),
@@ -199,7 +259,7 @@ class APGforForge(scripts.Script):
             (hStart,    "apg_fade_hStart"),
         ]
 
-        return (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star,
+        return (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star,
                 apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
                 fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart)
 
@@ -242,7 +302,7 @@ class APGforForge(scripts.Script):
         APGforForge.CFGweight = boostWeight * fadeWeight
 
     def process(self, p, *script_args, **kwargs):
-        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, apg_slg_scale,
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star, apg_slg_scale,
         apg_slg_layers, apg_slg_start, apg_slg_end,
         fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
@@ -258,11 +318,15 @@ class APGforForge(scripts.Script):
                     APG_ICG       = apg_icg,
                     APG_ICG_start = apg_icg_s,
                 ))
-            if apg_method == "APG":
+            if "APG" in apg_method:
                 p.extra_generation_params.update(dict(
                     APG_eta       = apg_eta,
                     APG_r         = apg_r,
                     APG_m         = apg_m,
+                ))
+            if "FDG" in apg_method:
+                p.extra_generation_params.update(dict(
+                    APG_FDG_scale = apg_fdg_scale,
                 ))
             if apg_post_cfg == "SLG (SD3)":
                 p.extra_generation_params.update(dict(
@@ -351,7 +415,7 @@ class APGforForge(scripts.Script):
 
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star,
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star,
         apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
         fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
@@ -422,6 +486,18 @@ class APGforForge(scripts.Script):
                             denoised = (2*cond_scale + 1.0) * cond - cond_scale * (bias + uncond)
                         else:
                             denoised = cond
+                        return input - denoised
+                    case "FDG":
+                        FDG_scale = []
+                        for num in apg_fdg_scale.split(','):
+                            if num.startswith('*'):
+                                FDG_scale.append(cond_scale * float(num[1:]))
+                            else:
+                                FDG_scale.append(float(num))
+
+                        if len(FDG_scale) <= 1:
+                            FDG_scale = [cond_scale, cond_scale]
+                        denoised = laplacian_guidance(cond, uncond, FDG_scale)
                         return input - denoised
                     case _:
                         # denoised = uncond + cond_scale * (cond - uncond)
