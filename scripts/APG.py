@@ -15,7 +15,7 @@ from modules.script_callbacks import on_cfg_denoiser, remove_current_script_call
 ####  Seyedmorteza Sadat, Tobias Vontobel, Farnood Salehi, Romann M. Weber
 
 from kornia.geometry import pyrup
-from kornia.geometry.transform import build_laplacian_pyramid
+from kornia.geometry.transform.pyramid import build_laplacian_pyramid
 
 def project(
     v0: torch.Tensor, # [B, C,H, W]
@@ -628,3 +628,4 @@ class APGforForge(scripts.Script):
 
         remove_current_script_callbacks()
         return
+
