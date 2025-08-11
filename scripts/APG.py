@@ -15,7 +15,12 @@ from modules.script_callbacks import on_cfg_denoiser, remove_current_script_call
 ####  Seyedmorteza Sadat, Tobias Vontobel, Farnood Salehi, Romann M. Weber
 
 from kornia.geometry import pyrup
-from kornia.geometry.transform.pyramid import build_laplacian_pyramid
+try:
+    from kornia.geometry.transform.pyramid import build_laplacian_pyramid
+    apg_functions = ["APG", "TraSCE", "method two", "FDG", "Normal"]
+except:
+    apg_functions = ["APG", "TraSCE", "method two", "Normal"]
+   
 
 def project(
     v0: torch.Tensor, # [B, C,H, W]
@@ -157,7 +162,7 @@ class APGforForge(scripts.Script):
     def ui(self, *args, **kwargs):
 
         with InputAccordion(False, label=self.title()) as apg_enabled:
-            apg_method = gr.Radio(label='CFG method', choices=["APG", "TraSCE", "method two", "FDG", "Normal"], value="APG")
+            apg_method = gr.Radio(label='CFG method', choices=apg_functions, value="APG")
 
             with InputAccordion(False, label='CFG fade') as fade_enabled:
                 with gr.Row():
@@ -628,4 +633,3 @@ class APGforForge(scripts.Script):
 
         remove_current_script_callbacks()
         return
-
