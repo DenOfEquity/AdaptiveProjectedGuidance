@@ -39,6 +39,11 @@ Also, some other experimental stuff. And SkipLayerGuidance for SD3.
 ---
 Also, Frequency-Decoupled Guidance: https://arxiv.org/pdf/2506.19713.
 
+>[!NOTE]
+>Requires `kornia>=0.6.8`. Forge default is v0.6.7. Edit `requirements_versions.txt` in the Forge webUI directory.
+>
+>FDG Option will be hidden if using older version.
+
 Input `Frequency-Decoupled Guidance scaler` is at least two numbers for high frequency and low frequency components:
 * `7.0, 1.5` is equivalent to high frequency CFG 7.0 and low frequency CFG 1.5.
 * more levels can be used: `7.0, 5.0, 1.5` for high, middle, low
