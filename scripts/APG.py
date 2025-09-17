@@ -198,7 +198,8 @@ class APGforForge(scripts.Script):
                 apg_icg = gr.Slider(label='image Independent Condition Guidance', minimum=0.0, maximum=0.2, step=0.001, value=0.0)
                 apg_icg_s = gr.Slider(label='ICG start', minimum=0.0, maximum=1.0, step=0.01, value=0.4)
             with gr.Row():
-                apg_star = gr.Checkbox(label='use CFG *', value=False)
+                apg_star = gr.Checkbox(label='CFG *', value=False)
+                apg_tdamp = gr.Checkbox(label='Tangential Damping', value=False)
 
             apg_post_cfg = gr.Radio(label='post CFG method', choices=["MaHiRo", "SLG (SD3)", "None"], value="None")
             with gr.Row(visible=False) as slg_1:
@@ -243,6 +244,7 @@ class APGforForge(scripts.Script):
             (apg_icg,       "APG_ICG"),
             (apg_icg_s,     "APG_ICG_start"),
             (apg_star,      "APG_CFGstar"),
+            (apg_tdamp,     "APG_Tangential_Damping"),
             (apg_slg_scale, "APG_SLG_scale"),
             (apg_slg_layers,"APG_SLG_layers"),
             (apg_slg_start, "APG_SLG_start"),
@@ -264,7 +266,7 @@ class APGforForge(scripts.Script):
             (hStart,    "apg_fade_hStart"),
         ]
 
-        return (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star,
+        return (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star, apg_tdamp, 
                 apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
                 fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart)
 
@@ -307,8 +309,8 @@ class APGforForge(scripts.Script):
         APGforForge.CFGweight = boostWeight * fadeWeight
 
     def process(self, p, *script_args, **kwargs):
-        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star, apg_slg_scale,
-        apg_slg_layers, apg_slg_start, apg_slg_end,
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star, tangential_damp, 
+        apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
         fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
         if apg_enabled:
@@ -317,6 +319,7 @@ class APGforForge(scripts.Script):
                 APG_method    = apg_method,
                 APG_post_cfg  = apg_post_cfg,
                 APG_CFGstar   = apg_star,
+                APG_Tangential_Damping = tangential_damp,
             ))
             if apg_icg > 0.0:
                 p.extra_generation_params.update(dict(
@@ -420,14 +423,14 @@ class APGforForge(scripts.Script):
 
 
     def process_before_every_sampling(self, p, *script_args, **kwargs):
-        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star,
+        (apg_enabled, apg_method, apg_post_cfg, apg_eta, apg_r, apg_m, apg_fdg_scale, apg_icg, apg_icg_s, apg_star, tangential_damp,
         apg_slg_scale, apg_slg_layers, apg_slg_start, apg_slg_end,
         fade_enabled, cntrMean, boostStep, highStep, maxScale, fadeStep, zeroStep, minScale, lowCFG1, highCFG1, reinhard, rescale, heuristic, hStart) = script_args
 
         if not apg_enabled:
             return
 
-        def patch(model, eta, r, m, icg, icg_start, cfg_star):
+        def patch(model, eta, r, m, icg, icg_start, cfg_star, tangential_damp):
             apg = APG(eta, r, m)
 
             def sampler_apg(args):
@@ -471,6 +474,26 @@ class APGforForge(scripts.Script):
 
                         uncond *= st_star.view(batch_size, 1, 1, 1)
 
+                    if tangential_damp:
+                        #https://arxiv.org/pdf/2503.18137
+                        # Mingi Kwon, Shin seong Kim, Yi Ting Hsiao, Jaeseok Jeong, Youngjung Uh
+ 
+                        all_noise = torch.stack((cond, uncond),dim=1).to(dtype=torch.float32)
+                        all_noise = all_noise.reshape(all_noise.size(0), all_noise.size(1), -1)
+
+                        U, S, Vh = torch.linalg.svd(all_noise, full_matrices=False)
+                        Vh = Vh.to(all_noise.device)
+                        Vh_modified = Vh.clone().to(all_noise.device)
+                        Vh_modified[:,1] = 0
+
+                        noise_null_flat = uncond.reshape(uncond.size(0), 1, -1).to(dtype=torch.float32)
+                        noise_null_flat = noise_null_flat.to(Vh.device)
+
+                        x_Vh = torch.matmul(noise_null_flat, Vh.transpose(-2,-1))
+                        x_Vh_V = torch.matmul(x_Vh, Vh_modified)
+
+                        uncond = x_Vh_V.reshape(*uncond.shape).to(cond.device, dtype=cond.dtype)
+ 
                     args["uncond"] = input - uncond
 
                 match apg_method:
@@ -614,7 +637,7 @@ class APGforForge(scripts.Script):
 
 
         unet = p.sd_model.forge_objects.unet
-        unet = patch(unet, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star)[0]
+        unet = patch(unet, apg_eta, apg_r, apg_m, apg_icg, apg_icg_s, apg_star, tangential_damp)[0]
         p.sd_model.forge_objects.unet = unet
 
         if apg_method == "TraSCE" or apg_method == "method two":
