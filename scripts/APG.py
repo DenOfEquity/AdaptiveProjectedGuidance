@@ -643,6 +643,8 @@ class APGforForge(scripts.Script):
         if apg_method == "TraSCE" or apg_method == "method two":
             empty_prompt = SdConditioning([""], is_negative_prompt=False, width=p.width, height=p.height)
             empty_cond = shared.sd_model.get_learned_conditioning(empty_prompt)
+            if isinstance(empty_cond, list):
+                empty_cond = torch.stack(empty_cond)
             APGforForge.empty = compile_conditions(empty_cond)
 
         return
